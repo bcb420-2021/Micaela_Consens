@@ -273,6 +273,8 @@ legend("topright", colnames(dataToPlot),
        border ="blue",  text.col = "green4",
        merge = TRUE, bg = "gray90")
 ```
+
+\
 We can see some data is not following the same overall pattern as the other samples. Let's normalize.
 
 **Normalizing**
@@ -308,6 +310,8 @@ legend("topright", colnames(dataToPlot),
        border ="blue",  text.col = "green4",
        merge = TRUE, bg = "gray90")
 ```
+
+\
 The boxplot is difficult to interpret, but you do see an adjustment towards the median especially between cases 181 to 223. The count density graph does also show a change in the dataset distribution after normalization. The patients are more tightly clustered, for one.
 
 **MDS Plot**
@@ -315,6 +319,8 @@ The boxplot is difficult to interpret, but you do see an adjustment towards the 
 ```{r message = FALSE}
 plotMDS(d, labels=(metainfo$title), col = c("green","blue", "red")[factor(metainfo$status)])
 ```
+
+\
 Here the colour-coding is defined as follows:
 Blue are patients that have never had PTSD, red are patients that have been diagnosed in the past with PTSD, and green are patients that currently have PTSD.
     
