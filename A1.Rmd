@@ -1,0 +1,349 @@
+---
+title: "A1 - Micaela Consens"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+Install packages & load libraries necessary.
+```{r message = FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+if (!requireNamespace("GEOmetadb", quietly = TRUE))
+    BiocManager::install("GEOmetadb")
+if (!requireNamespace("gridExtra", quietly = TRUE))
+    install.packages("gridExtra")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+    BiocManager::install("org.Hs.eg.db")
+if (!requireNamespace("knitr", quietly = TRUE))
+    install.packages("knitr")
+if (!requireNamespace("biomaRt", quietly = TRUE))
+    BiocManager::install("biomaRt")
+if (!requireNamespace("edgeR", quietly = TRUE))
+    BiocManager::install("edgeR")
+if (!requireNamespace("RSQLite", quietly = TRUE))
+    install.packages("RSQLite")
+if (!requireNamespace("dplyr", quietly = TRUE))
+    install.packages("dplyr")
+if (!requireNamespace("tibble", quietly = TRUE))
+    install.packages("tibble")
+library(edgeR)
+library(gridExtra)
+library(knitr)
+library(GEOmetadb)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(RSQLite)
+library(magrittr)
+library(dplyr)
+library(tibble)
+
+```
+
+## Select a Dataset
+
+```{r message = FALSE}
+if(!file.exists('GEOmetadb.sqlite')) getSQLiteFile()
+con <- dbConnect(SQLite(),'GEOmetadb.sqlite')
+sql <- paste("SELECT DISTINCT gse.title,gse.gse, gpl.title,"," gse.submission_date,"," gse.supplementary_file","FROM","  gse JOIN gse_gpl ON gse_gpl.gse=gse.gse","  JOIN gpl ON gse_gpl.gpl=gpl.gpl","WHERE","  gse.submission_date > '2016-01-01' AND", "  gpl.organism LIKE '%Homo sapiens%' AND","  gpl.technology LIKE '%high-throughput sequencing%' ","  ORDER BY gse.submission_date DESC",sep=" ")
+rs <- dbGetQuery(con,sql)
+unlist(lapply(rs$supplementary_file,              FUN = function(x){x <- unlist(strsplit(x,";")) ;              x <- x[grep(x,pattern="txt",ignore.case = TRUE)];                tail(unlist(strsplit(x,"/")),n=1)})) [1:10]
+counts_files <- rs$supplementary_file[grep(rs$supplementary_file,                              pattern = "count",ignore.case = TRUE)]
+```
+
+
+
+The Expression Dataset I chose was [GSE97356: Gene expression associated with PTSD in World Trade Center responders: An RNA sequencing study](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE97356).
+
+
+**A bit about the dataset**
+
+```{r message = FALSE}
+gse <- getGEO("GSE97356",GSEMatrix=FALSE)
+```
+
+Dataset details:
+
+```{r echo = FALSE, results = TRUE, message = FALSE}
+data.frame(head(Meta(gse)))
+```
+
+Dataset platform details:
+
+```{r echo = FALSE, message = FALSE}
+currentGpl <- names(GPLList(gse))[1]
+currentGplInfo <- Meta(getGEO(currentGpl))
+```
+**Name of Platform:** `r currentGplInfo$title`
+
+**Submission Data Date:** `r currentGplInfo$submission_date`
+
+**Last Date Data was Updated:** `r currentGplInfo$last_update_date`
+
+**Organisms Included in Platform:** `r currentGplInfo$organism`
+
+**Quantity of GEO datasets that use this Platform:** `r length(currentGplInfo$series_id)`
+
+**Quantity of GEO samples that use this Platform:** `r length(currentGplInfo$sample_id)`
+
+
+
+## Clean the Data and Map to HUGO Symbols
+
+**Downloading the data**
+
+```{r message = FALSE}
+if(!file.exists('GEOmetadb.sqlite')) getSQLiteFile()
+con <- dbConnect(SQLite(),'GEOmetadb.sqlite')
+sfiles <- getGEOSuppFiles('GSE97356')
+fnames = rownames(sfiles) 
+reads = read.delim(fnames[1],header=TRUE,sep = ",")
+#rename first column to genes, as it's more meaningful than X
+colnames(reads)[1] <- c("Gene")
+```
+The dimensions of my dataset are: `r dim(reads)`
+
+This means there are 25830 rows and 325 columns (the rows indicate genes and the columns are samples, ignoring the first column which delimits that the rows are genes).
+
+I have three kinds of samples in my 324 subjects, based on the study design. The study design says "324 human samples; 201 never, 82 current, 41 past with PTSD". I want to get a list of which subjects have never/current/past PTSD diagnosis to compare to my reads dataframe. 
+
+```{r message = FALSE}
+for(i in 1:324) {
+    status <- gse@gsms[[i]]@header["characteristics_ch1"][[1]][1]
+    case <- gse@gsms[[i]]@header["title"]
+    if(i==1){
+        metainfo <- data.frame("status"= status, "case" = case)
+    }
+    else{
+        currentMetainfo <- data.frame("status"= status, "case" = case)
+        metainfo <- rbind(metainfo, currentMetainfo)
+    }
+}
+#for a sanity check ensure correct number of subjects with current/never/past PTSD diagnosis
+occurences<-table(unlist(metainfo$status))
+print(occurences)
+```
+
+The metainformation found in the gse shows `r occurences[1]` subjects with current PTSD, `r occurences[2]` subjects who never had PTSD, and `r occurences[3]` who had past PTSD diagnosis. This doesn't match the study design... but I looked at the paper and the published paper shows: "201 with never, 81 current, 42 past PTSD", so we are actually correctly parsing the data, the study design is incorrectly labelled on GEO.
+
+
+**Filter weakly expressed features from my dataset**
+
+I'm going to filter lowly expressed genes using edgeR. Since I am keeping the genes that have at least 1 count per million within smallest group sample size, which is 42 (past PTSD), I'm looking for genes that have at least 1 count per million at least 42 times. 
+```{r message = FALSE}
+cpms = cpm(reads[,2:325])
+#add in the genes associated with rownames
+rownames(cpms) <- reads[,1]
+qualityReads = rowSums(cpms >1) >= 42
+filteredReads = reads[qualityReads,]
+```
+
+The filtered dimensions of the dataset now are: `r dim(filteredReads)`.
+
+During filtering we removed `r dim(reads)[1] -  dim(filteredReads)[1]` genes.
+
+**Checking for duplicates after filtering **
+
+I'm going to see if the dataset has duplicates:
+```{r message = FALSE}
+filteredReadsDf <- data.frame(table(filteredReads$Gene))
+colnames(filteredReadsDf) <- c("Gene", "GeneOccurence")
+duplicates <- filteredReadsDf %>% filter(GeneOccurence > 1)
+```
+
+It looks like I don't have any duplicated gene names, the number of duplicated gene names is `r sum(filteredReadsDf$GeneOccurence > 1)` .
+
+Let's take a look at how the gene names are stored:
+```{r message = FALSE}
+head(filteredReadsDf$Gene, 5)
+```
+
+Looking at gene AADACL2-AS1 for example, I see it is AADACL2 Antisense RNA 1. These appear to be gene ids, but I want to convert to HUGO symbols. I'm going to see if I can find the corresponding ensembl ids.
+
+
+**Mapping to Ensembl Ids**
+
+```{r message = FALSE}
+grch37 <- useMart(biomart="ENSEMBL_MART_ENSEMBL", host="grch37.ensembl.org", path="/biomart/martservice") #from https://support.bioconductor.org/p/62064/
+ensembl_grch37 = useDataset("hsapiens_gene_ensembl",mart=grch37)
+idToEnsembl <- getBM(attributes = c("wikigene_name", "ensembl_gene_id"),
+               filters = c("wikigene_name"),
+               values = filteredReads$Gene,
+               mart = ensembl_grch37)
+```
+I can see that I have `r sum(idToEnsembl$ensembl_gene_id == "")` gene ids that do not map to ensembl ids, so I'm not concerned. I'm now going to convert the ensembl ids to HUGO symbols. 
+
+**Mapping to HUGO symbols**
+
+```{r message = FALSE}
+#first add the ensembl id labels to filteredReads
+colnames(idToEnsembl) <- c("Gene", "EnsemblId")
+filteredReads <- merge(idToEnsembl, filteredReads, by="Gene")
+#now lets get the corresponding HUGO symbols
+ensemblToHUGO <- getBM(attributes = c("ensembl_gene_id","hgnc_symbol"),
+                   filters = c("ensembl_gene_id"),
+                   values = filteredReads$EnsemblId,
+                   mart = ensembl_grch37)
+```
+
+Now I have `r sum(ensemblToHUGO$hgnc_symbol == "")` ensembl ids that do not map to HUGO symbols. Lets see how many ensembl ids are duplicated.
+
+**Checking for duplicates in Ensembl Ids**
+
+```{r message = FALSE}
+filteredReadsDfEnsembl <- data.frame(table(filteredReads$EnsemblId))
+colnames(filteredReadsDfEnsembl) <- c("EnsemblGene", "GeneOccurence")
+duplicates <- filteredReadsDfEnsembl %>% filter(GeneOccurence > 1)
+length(duplicates$EnsemblGene)
+```
+
+I have `r length(duplicates$EnsemblGene)` duplicated ensembl ids. I wonder how large the overlap between the gene names that are duplicated and those that do not have HUGO symbols is. 
+
+```{r message = FALSE}
+#first add the HUGO symbols to to filteredReads
+colnames(ensemblToHUGO) <- c("EnsemblId", "HUGOSymbol")
+filteredReads <- merge(ensemblToHUGO, filteredReads, by="EnsemblId")
+
+emptyHUGO <- filteredReads %>% filter(HUGOSymbol == "")
+duplicatedEnsembl <- data.frame(duplicates$EnsemblGene)
+colnames(duplicatedEnsembl) <- c("EnsemblId")
+overlapMissingDuplicated <- merge(emptyHUGO, duplicatedEnsembl, by="EnsemblId")
+length(overlapMissingDuplicated$EnsemblId)
+```
+
+It looks like there are `r length(overlapMissingDuplicated$EnsemblId)` gene names that are duplicated ensembl ids and do not have HUGO symbols. The gene names that are missing HUGO symbols make up `r length(emptyHUGO$EnsemblId)/length(filteredReads$EnsemblId)*100` % of the dataset. As some of these, `r length(overlapMissingDuplicated$EnsemblId)/length(duplicatedEnsembl$EnsemblId)*100` % exactly, have no corresponding HUGO symbol, but all have unique wikigene names, I'm not sure whether these genes are being mapped correctly and don't feel comfortable removing them.
+
+Additionally, according to lecture 4 slides 26 "if we base our analysis on ensembl gene ids then they are unique elements" as a comment not to necessarily filter out duplicates, and as I have removed lowly expressed genes I feel this is enough at this stage. Instead I'm going to try and preserve all these genes with duplicated names and just create versions of them so theyre unique. This is because the end goal of this assignment is to produce a dataframe with `r nrow(metainfo)` numeric columns where each row has unique HUGO symbols as rownames. Lets see how many HUGO symbols are duplicated:
+
+```{r message = FALSE}
+filteredReadsDfHUGO <- data.frame(table(filteredReads$HUGOSymbol))
+colnames(filteredReadsDfHUGO) <- c("HUGOGene", "GeneOccurence")
+HUGOduplicates <- filteredReadsDfHUGO %>% filter(GeneOccurence > 1)
+length(HUGOduplicates$HUGOGene)
+```
+
+There are `r length(HUGOduplicates$HUGOGene) - length(duplicatedEnsembl$EnsemblId)` more duplicated HUGO symbols than ensembl ids. This is a lot. 
+
+```{r message = FALSE}
+duplicatedHUGO <- data.frame(HUGOduplicates$HUGOGene)
+colnames(duplicatedHUGO) <- c("HUGOSymbol")
+duplicatedHUGOFull <- merge(duplicatedHUGO, filteredReads, by="HUGOSymbol")
+duplicatedHUGOEnsembl <- merge(duplicatedHUGOFull, duplicatedEnsembl)
+length(unique(duplicatedHUGOEnsembl$EnsemblId))
+```
+
+This shows at least that all the duplicated ensembl ids also have duplicated HUGO symbols, so I'm really contending with the `r length(HUGOduplicates$HUGOGene) - length(duplicatedEnsembl$EnsemblId)`  duplicated HUGO symbol genes. I'm going to make the namings of these symbols unique so I can keep them all as discussed above. First I'm going to remove the ensembl ids that do not map to HUGO symbols, of which  `r length(overlapMissingDuplicated$EnsemblId)` are duplicated.
+
+```{r message = FALSE}
+filteredReadsFinal <- filteredReads %>% filter(HUGOSymbol != "")
+```
+
+I lost `r nrow(filteredReads) - nrow(filteredReadsFinal)` genes that didn't have HUGO symbols. Now I'm going to make the namings of the HUGO symbols unique.
+
+```{r message = FALSE}
+filteredReadsFinal <- filteredReadsFinal[, c(2,4:ncol(filteredReadsFinal))]
+filteredReadsFinal$HUGOSymbol <- make.names(filteredReadsFinal$HUGOSymbol, unique=TRUE)
+filteredReadsFinal <- tibble::column_to_rownames(filteredReadsFinal, var="HUGOSymbol")
+```
+
+## Apply Normalization
+
+**Visualize the data**
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+dataToPlot <- log2(cpm(filteredReadsFinal))
+boxplot(dataToPlot , xlab = "Samples", ylab = "log2 CPM",las = 2, cex = 0.5, cex.lab = 0.5,        cex.axis = 0.5, main = "GSE97356 RNASeq Samples")
+abline(h = median(apply(dataToPlot, 2, median)), col = "red", lwd = 0.8, lty = "dashed")
+```
+
+```{r message = FALSE}
+countDensity <- apply(log2(cpm(filteredReadsFinal)), 2, density)
+xlim <- 0; ylim <- 0
+for (i in 1:length(countDensity)) {
+  xlim <- range(c(xlim, countDensity[[i]]$x));
+  ylim <- range(c(ylim, countDensity[[i]]$y))
+}
+cols <- rainbow(length(countDensity))
+ltys <- rep(1, length(countDensity))
+p1 <- plot(countDensity[[1]], xlim=xlim, ylim=ylim, type="n",
+     ylab="Smoothing density of log2-CPM", main="", cex.lab = 0.85)
+for (i in 1:length(countDensity)) lines(countDensity[[i]], col=cols[i], lty=ltys[i])
+legend("topright", colnames(dataToPlot),
+       col=cols, lty=ltys, cex=0.75,
+       border ="blue",  text.col = "green4",
+       merge = TRUE, bg = "gray90")
+```
+We can see some data is not following the same overall pattern as the other samples. Let's normalize.
+
+**Normalizing**
+
+```{r echo = FALSE, message = FALSE}
+filteredDataMatrix <- as.matrix(filteredReadsFinal)
+d = DGEList(counts=filteredDataMatrix, group=metainfo$status)
+d = calcNormFactors(d)
+normalizedCounts <- cpm(d)
+```
+
+Let's see if we can understand what happened visually.
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+dataToPlotNorm <- log2(normalizedCounts)
+boxplot(dataToPlotNorm , xlab = "Samples", ylab = "log2 CPM",las = 2, cex = 0.5, cex.lab = 0.5,        cex.axis = 0.5, main = "GSE97356 RNASeq Samples")
+abline(h = median(apply(dataToPlot, 2, median)), col = "red", lwd = 0.8, lty = "dashed")
+```
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+countDensity <- apply(log2(normalizedCounts), 2, density)
+xlim <- 0; ylim <- 0
+for (i in 1:length(countDensity)) {
+  xlim <- range(c(xlim, countDensity[[i]]$x));
+  ylim <- range(c(ylim, countDensity[[i]]$y))
+}
+cols <- rainbow(length(countDensity))
+ltys <- rep(1, length(countDensity))
+p1 <- plot(countDensity[[1]], xlim=xlim, ylim=ylim, type="n",
+     ylab="Smoothing density of log2-CPM", main="", cex.lab = 0.85)
+for (i in 1:length(countDensity)) lines(countDensity[[i]], col=cols[i], lty=ltys[i])
+legend("topright", colnames(dataToPlot),
+       col=cols, lty=ltys, cex=0.75,
+       border ="blue",  text.col = "green4",
+       merge = TRUE, bg = "gray90")
+```
+The boxplot is difficult to interpret, but you do see an adjustment towards the median especially between cases 181 to 223. The count density graph does also show a change in the dataset distribution after normalization. The patients are more tightly clustered, for one.
+
+**MDS Plot**
+
+```{r message = FALSE}
+plotMDS(d, labels=(metainfo$title), col = c("green","blue", "red")[factor(metainfo$status)])
+```
+Here the colour-coding is defined as follows:
+Blue are patients that have never had PTSD, red are patients that have been diagnosed in the past with PTSD, and green are patients that currently have PTSD.
+    
+Since MDS plot represents the distances between samples, we would hope to see past,never and current patients cluster together, but we don't quite see this.
+
+
+## Interpret the Data
+
+1. What are the control and test conditions of the dataset?\
+    The control and test conditions are actually stratified into three groups, patients with no PTSD diagnosis ever (never), patients that currently have PTSD diagnosis (current), and patients that previously have been diagnosed with PTSD (past).
+2. Why is the dataset of interest to you?\
+    I find the dataset interesting as my research project placement work for the Bioinformatics Specialist has been done at the CAMH Krembil Centre for Neuroinformatics. I have focused on analyzing cell type proportion changes in bulk-tissue RNAseq sampled from patients with Alzheimer's disease. As a member of two different labs for BCB330 and BCB430 I have also been exposed to research on addiction & mental health & more broadly on how the brain changes in response to various trauma. Therefore I find it very interesting to continue to explore how gene expression patterns in the brain can be used to understand the neuropathologies and symptoms of mental illness/neurodegenerative disorders.
+3. Were there expression values that were not unique for specific genes? How did you handle these?\
+    The expression values I started with were unique, but once mapped to ensembl ids there were duplicates. I decided to keep them in the dataset upon further analysis as described above.
+4. Were there expression values that could not be mapped to current HUGO symbols?\
+    Yes. There were `r sum(ensemblToHUGO$hgnc_symbol == "")` ensembl ids that did not map to HUGO symbols.
+5. How many outliers were removed?\
+    During filtering we removed `r dim(reads)[1] -  dim(filteredReads)[1]` genes.
+6. How did you handle replicates?\
+    I chose not to remove them (see section: Checking for duplicates again).
+7. What is the final coverage of your dataset?\
+I lost `r nrow(reads) - nrow(filteredReadsFinal)` genes in filtering and mapping to HUGO Symbols, and 0 subjects or genes in normalization.
+
+## References
+
+1. 	Kuan PF, Waszczuk MA, Kotov R, Clouston S et al. Gene expression associated with PTSD in World Trade Center responders: An RNA sequencing study. Transl Psychiatry 2017 Dec 18;7(12):1297. PMID: 29249826
+
+2. Marin-Garcia, P. (2015). How to use biomaRt with ensembl build 37. Retrieved from https://support.bioconductor.org/p/62064/
+
+3. Sininho (2017, February 01). Is it OK to remove outliers from data? Retrieved from https://stats.stackexchange.com/questions/200534/is-it-ok-to-remove-outliers-from-data/200923
+
+
