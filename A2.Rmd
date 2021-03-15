@@ -1,0 +1,715 @@
+---
+title: "A2 - Micaela Consens"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+Install packages & load libraries necessary.
+```{r message = FALSE, echo = FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+if (!requireNamespace("GEOmetadb", quietly = TRUE))
+    BiocManager::install("GEOmetadb")
+if (!requireNamespace("gridExtra", quietly = TRUE))
+    install.packages("gridExtra")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+    BiocManager::install("org.Hs.eg.db")
+if (!requireNamespace("knitr", quietly = TRUE))
+    install.packages("knitr")
+if (!requireNamespace("biomaRt", quietly = TRUE))
+    BiocManager::install("biomaRt")
+if (!requireNamespace("edgeR", quietly = TRUE))
+    BiocManager::install("edgeR")
+if (!requireNamespace("RSQLite", quietly = TRUE))
+    install.packages("RSQLite")
+if (!requireNamespace("dplyr", quietly = TRUE))
+    install.packages("dplyr")
+if (!requireNamespace("tibble", quietly = TRUE))
+    install.packages("tibble")
+if (!requireNamespace("ComplexHeatmap", quietly = TRUE))
+    install.packages("ComplexHeatmap")
+if (!requireNamespace("circlize", quietly = TRUE))
+    install.packages("circlize")
+if (!requireNamespace("kableExtra", quietly = TRUE))
+    BiocManager::install("kableExtra")
+if (!requireNamespace("stringr", quietly = TRUE))
+    install.packages("stringr")
+if (!requireNamespace("utils", quietly = TRUE))
+    install.packages("utils")
+library(edgeR)
+library(gridExtra)
+library(knitr)
+library(GEOmetadb)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(RSQLite)
+library(magrittr)
+library(dplyr)
+library(tibble)
+library(ComplexHeatmap)
+library(circlize)
+library(kableExtra)
+library(stringr)
+library(utils)
+```
+
+## Recap of A1
+
+The Expression Dataset I chose was [GSE97356: Gene expression associated with PTSD in World Trade Center responders: An RNA sequencing study](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE97356).
+
+
+**A bit about the dataset**
+
+```{r message = FALSE}
+gse <- getGEO("GSE97356",GSEMatrix=FALSE)
+```
+
+Dataset details:
+
+```{r echo = FALSE, results = TRUE, message = FALSE}
+data.frame(head(Meta(gse)))
+```
+
+Dataset platform details:
+
+```{r echo = FALSE, message = FALSE}
+currentGpl <- names(GPLList(gse))[1]
+currentGplInfo <- Meta(getGEO(currentGpl))
+```
+**Name of Platform:** `r currentGplInfo$title`
+
+**Submission Data Date:** `r currentGplInfo$submission_date`
+
+**Last Date Data was Updated:** `r currentGplInfo$last_update_date`
+
+**Organisms Included in Platform:** `r currentGplInfo$organism`
+
+**Quantity of GEO datasets that use this Platform:** `r length(currentGplInfo$series_id)`
+
+**Quantity of GEO samples that use this Platform:** `r length(currentGplInfo$sample_id)`
+
+
+
+**Clean the Data and Map to HUGO Symbols**
+
+
+```{r message = FALSE}
+if(!file.exists('GEOmetadb.sqlite')) getSQLiteFile()
+con <- dbConnect(SQLite(),'GEOmetadb.sqlite')
+sfiles <- getGEOSuppFiles('GSE97356')
+fnames = rownames(sfiles) 
+reads = read.delim(fnames[1],header=TRUE,sep = ",")
+#rename first column to genes, as it's more meaningful than X
+colnames(reads)[1] <- c("Gene")
+```
+The dimensions of my dataset are: `r dim(reads)`
+
+This means there are 25830 rows and 325 columns (the rows indicate genes and the columns are samples, ignoring the first column which delimits that the rows are genes).
+
+I have three kinds of samples in my 324 subjects, based on the study design. The study design says "324 human samples; 201 never, 82 current, 41 past with PTSD". I want to get a list of which subjects have never/current/past PTSD diagnosis to compare to my reads dataframe. 
+
+```{r message = FALSE}
+for(i in 1:324) {
+    status <- gse@gsms[[i]]@header["characteristics_ch1"][[1]][1]
+    case <- gse@gsms[[i]]@header["title"]
+    if(i==1){
+        metainfo <- data.frame("status"= status, "case" = case)
+    }
+    else{
+        currentMetainfo <- data.frame("status"= status, "case" = case)
+        metainfo <- rbind(metainfo, currentMetainfo)
+    }
+}
+#for a sanity check ensure correct number of subjects with current/never/past PTSD diagnosis
+occurences<-table(unlist(metainfo$status))
+print(occurences)
+```
+
+The metainformation found in the gse shows `r occurences[1]` subjects with current PTSD, `r occurences[2]` subjects who never had PTSD, and `r occurences[3]` who had past PTSD diagnosis. This doesn't match the study design... but I looked at the paper and the published paper shows: "201 with never, 81 current, 42 past PTSD", so we are actually correctly parsing the data, the study design is incorrectly labelled on GEO.
+
+
+**Filter weakly expressed features from my dataset**
+
+I'm going to filter lowly expressed genes using edgeR. Since I am keeping the genes that have at least 1 count per million within smallest group sample size, which is 42 (past PTSD), I'm looking for genes that have at least 1 count per million at least 42 times. 
+```{r message = FALSE}
+cpms = cpm(reads[,2:325])
+#add in the genes associated with rownames
+rownames(cpms) <- reads[,1]
+qualityReads = rowSums(cpms >1) >= 42
+filteredReads = reads[qualityReads,]
+```
+
+The filtered dimensions of the dataset now are: `r dim(filteredReads)`.
+
+During filtering we removed `r dim(reads)[1] -  dim(filteredReads)[1]` genes.
+
+**Checking for duplicates after filtering**
+
+I'm going to see if the dataset has duplicates:
+```{r message = FALSE}
+filteredReadsDf <- data.frame(table(filteredReads$Gene))
+colnames(filteredReadsDf) <- c("Gene", "GeneOccurence")
+duplicates <- filteredReadsDf %>% filter(GeneOccurence > 1)
+```
+
+It looks like I don't have any duplicated gene names, the number of duplicated gene names is `r sum(filteredReadsDf$GeneOccurence > 1)` .
+
+Let's take a look at how the gene names are stored:
+```{r message = FALSE}
+head(filteredReadsDf$Gene, 5)
+```
+
+Looking at gene AADACL2-AS1 for example, I see it is AADACL2 Antisense RNA 1. These appear to be gene ids, but I want to convert to HUGO symbols. I'm going to see if I can find the corresponding ensembl ids.
+
+
+**Mapping to Ensembl Ids**
+
+```{r message = FALSE}
+grch37 <- useMart(biomart="ENSEMBL_MART_ENSEMBL", host="grch37.ensembl.org", path="/biomart/martservice") #from https://support.bioconductor.org/p/62064/
+ensembl_grch37 = useDataset("hsapiens_gene_ensembl",mart=grch37)
+idToEnsembl <- getBM(attributes = c("wikigene_name", "ensembl_gene_id"),
+               filters = c("wikigene_name"),
+               values = filteredReads$Gene,
+               mart = ensembl_grch37)
+```
+I can see that I have `r sum(idToEnsembl$ensembl_gene_id == "")` gene ids that do not map to ensembl ids, so I'm not concerned. I'm now going to convert the ensembl ids to HUGO symbols. 
+
+**Mapping to HUGO symbols**
+
+```{r message = FALSE}
+#first add the ensembl id labels to filteredReads
+colnames(idToEnsembl) <- c("Gene", "EnsemblId")
+filteredReads <- merge(idToEnsembl, filteredReads, by="Gene")
+#now lets get the corresponding HUGO symbols
+ensemblToHUGO <- getBM(attributes = c("ensembl_gene_id","hgnc_symbol"),
+                   filters = c("ensembl_gene_id"),
+                   values = filteredReads$EnsemblId,
+                   mart = ensembl_grch37)
+```
+
+Now I have `r sum(ensemblToHUGO$hgnc_symbol == "")` ensembl ids that do not map to HUGO symbols. Lets see how many ensembl ids are duplicated.
+
+**Checking for duplicates in Ensembl Ids**
+
+```{r message = FALSE}
+filteredReadsDfEnsembl <- data.frame(table(filteredReads$EnsemblId))
+colnames(filteredReadsDfEnsembl) <- c("EnsemblGene", "GeneOccurence")
+duplicates <- filteredReadsDfEnsembl %>% filter(GeneOccurence > 1)
+length(duplicates$EnsemblGene)
+```
+
+I have `r length(duplicates$EnsemblGene)` duplicated ensembl ids. I wonder how large the overlap between the gene names that are duplicated and those that do not have HUGO symbols is. 
+
+```{r message = FALSE}
+#first add the HUGO symbols to to filteredReads
+colnames(ensemblToHUGO) <- c("EnsemblId", "HUGOSymbol")
+filteredReads <- merge(ensemblToHUGO, filteredReads, by="EnsemblId")
+
+emptyHUGO <- filteredReads %>% filter(HUGOSymbol == "")
+duplicatedEnsembl <- data.frame(duplicates$EnsemblGene)
+colnames(duplicatedEnsembl) <- c("EnsemblId")
+overlapMissingDuplicated <- merge(emptyHUGO, duplicatedEnsembl, by="EnsemblId")
+length(overlapMissingDuplicated$EnsemblId)
+```
+
+It looks like there are `r length(overlapMissingDuplicated$EnsemblId)` gene names that are duplicated ensembl ids and do not have HUGO symbols. The gene names that are missing HUGO symbols make up `r length(emptyHUGO$EnsemblId)/length(filteredReads$EnsemblId)*100` % of the dataset. As some of these, `r length(overlapMissingDuplicated$EnsemblId)/length(duplicatedEnsembl$EnsemblId)*100` % exactly, have no corresponding HUGO symbol, but all have unique wikigene names, I'm not sure whether these genes are being mapped correctly and don't feel comfortable removing them.
+
+Additionally, according to lecture 4 slides 26 "if we base our analysis on ensembl gene ids then they are unique elements" as a comment not to necessarily filter out duplicates, and as I have removed lowly expressed genes I feel this is enough at this stage. Instead I'm going to try and preserve all these genes with duplicated names and just create versions of them so theyre unique. This is because the end goal of this assignment is to produce a dataframe with `r nrow(metainfo)` numeric columns where each row has unique HUGO symbols as rownames. Lets see how many HUGO symbols are duplicated:
+
+```{r message = FALSE}
+filteredReadsDfHUGO <- data.frame(table(filteredReads$HUGOSymbol))
+colnames(filteredReadsDfHUGO) <- c("HUGOGene", "GeneOccurence")
+HUGOduplicates <- filteredReadsDfHUGO %>% filter(GeneOccurence > 1)
+length(HUGOduplicates$HUGOGene)
+```
+
+There are `r length(HUGOduplicates$HUGOGene) - length(duplicatedEnsembl$EnsemblId)` more duplicated HUGO symbols than ensembl ids. This is a lot. 
+
+```{r message = FALSE}
+duplicatedHUGO <- data.frame(HUGOduplicates$HUGOGene)
+colnames(duplicatedHUGO) <- c("HUGOSymbol")
+duplicatedHUGOFull <- merge(duplicatedHUGO, filteredReads, by="HUGOSymbol")
+duplicatedHUGOEnsembl <- merge(duplicatedHUGOFull, duplicatedEnsembl)
+length(unique(duplicatedHUGOEnsembl$EnsemblId))
+```
+
+This shows at least that all the duplicated ensembl ids also have duplicated HUGO symbols, so I'm really contending with the `r length(HUGOduplicates$HUGOGene) - length(duplicatedEnsembl$EnsemblId)`  duplicated HUGO symbol genes. I'm going to make the namings of these symbols unique so I can keep them all as discussed above. First I'm going to remove the ensembl ids that do not map to HUGO symbols, of which  `r length(overlapMissingDuplicated$EnsemblId)` are duplicated.
+
+```{r message = FALSE}
+filteredReadsFinal <- filteredReads %>% filter(HUGOSymbol != "")
+```
+
+I lost `r nrow(filteredReads) - nrow(filteredReadsFinal)` genes that didn't have HUGO symbols. Now I'm going to make the namings of the HUGO symbols unique.
+
+```{r message = FALSE}
+filteredReadsFinal <- filteredReadsFinal[, c(2,4:ncol(filteredReadsFinal))]
+filteredReadsFinal$HUGOSymbol <- make.names(filteredReadsFinal$HUGOSymbol, unique=TRUE)
+filteredReadsFinal <- tibble::column_to_rownames(filteredReadsFinal, var="HUGOSymbol")
+```
+
+**Apply Normalization**
+
+**Visualize the data**
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+dataToPlot <- log2(cpm(filteredReadsFinal))
+boxplot(dataToPlot , xlab = "Samples", ylab = "log2 CPM",las = 2, cex = 0.5, cex.lab = 0.5,        cex.axis = 0.5, main = "GSE97356 RNASeq Samples")
+abline(h = median(apply(dataToPlot, 2, median)), col = "red", lwd = 0.8, lty = "dashed")
+```
+
+```{r message = FALSE}
+countDensity <- apply(log2(cpm(filteredReadsFinal)), 2, density)
+xlim <- 0; ylim <- 0
+for (i in 1:length(countDensity)) {
+  xlim <- range(c(xlim, countDensity[[i]]$x));
+  ylim <- range(c(ylim, countDensity[[i]]$y))
+}
+cols <- rainbow(length(countDensity))
+ltys <- rep(1, length(countDensity))
+p1 <- plot(countDensity[[1]], xlim=xlim, ylim=ylim, type="n",
+     ylab="Smoothing density of log2-CPM", main="", cex.lab = 0.85)
+for (i in 1:length(countDensity)) lines(countDensity[[i]], col=cols[i], lty=ltys[i])
+legend("topright", colnames(dataToPlot),
+       col=cols, lty=ltys, cex=0.75,
+       border ="blue",  text.col = "green4",
+       merge = TRUE, bg = "gray90")
+```
+\
+We can see some data is not following the same overall pattern as the other samples. Let's normalize.
+
+**Normalizing**
+
+```{r echo = FALSE, message = FALSE}
+filteredDataMatrix <- as.matrix(filteredReadsFinal)
+d = DGEList(counts=filteredDataMatrix, group=metainfo$status)
+d = calcNormFactors(d)
+normalizedCounts <- cpm(d)
+```
+
+Let's see if we can understand what happened visually.
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+dataToPlotNorm <- log2(normalizedCounts)
+boxplot(dataToPlotNorm , xlab = "Samples", ylab = "log2 CPM",las = 2, cex = 0.5, cex.lab = 0.5,        cex.axis = 0.5, main = "GSE97356 RNASeq Samples")
+abline(h = median(apply(dataToPlot, 2, median)), col = "red", lwd = 0.8, lty = "dashed")
+```
+
+```{r echo = FALSE, warning = FALSE, message = FALSE}
+countDensity <- apply(log2(normalizedCounts), 2, density)
+xlim <- 0; ylim <- 0
+for (i in 1:length(countDensity)) {
+  xlim <- range(c(xlim, countDensity[[i]]$x));
+  ylim <- range(c(ylim, countDensity[[i]]$y))
+}
+cols <- rainbow(length(countDensity))
+ltys <- rep(1, length(countDensity))
+p1 <- plot(countDensity[[1]], xlim=xlim, ylim=ylim, type="n",
+     ylab="Smoothing density of log2-CPM", main="", cex.lab = 0.85)
+for (i in 1:length(countDensity)) lines(countDensity[[i]], col=cols[i], lty=ltys[i])
+legend("topright", colnames(dataToPlot),
+       col=cols, lty=ltys, cex=0.75,
+       border ="blue",  text.col = "green4",       merge = TRUE, bg = "gray90")
+```
+
+\
+The boxplot is difficult to interpret, but you do see an adjustment towards the median especially between cases 181 to 223. The count density graph does also show a change in the dataset distribution after normalization. The patients are more tightly clustered, for one.
+
+**MDS Plot**
+
+```{r message = FALSE}
+plotMDS(d, labels=(metainfo$title), col = c("green","blue", "red")[factor(metainfo$status)])
+```
+
+\
+Here the colour-coding is defined as follows:
+Blue are patients that have never had PTSD, red are patients that have been diagnosed in the past with PTSD, and green are patients that currently have PTSD.
+    
+Since MDS plot represents the distances between samples, we would hope to see past,never and current patients cluster together, but we don't quite see this.
+
+
+## Interpret the Data
+
+1. What are the control and test conditions of the dataset?\
+    The control and test conditions are actually stratified into three groups, patients with no PTSD diagnosis ever (never), patients that currently have PTSD diagnosis (current), and patients that previously have been diagnosed with PTSD (past).
+2. Why is the dataset of interest to you?\
+    I find the dataset interesting as my research project placement work for the Bioinformatics Specialist has been done at the CAMH Krembil Centre for Neuroinformatics. I have focused on analyzing cell type proportion changes in bulk-tissue RNAseq sampled from patients with Alzheimer's disease. As a member of two different labs for BCB330 and BCB430 I have also been exposed to research on addiction & mental health & more broadly on how the brain changes in response to various trauma. Therefore I find it very interesting to continue to explore how gene expression patterns in the brain can be used to understand the neuropathologies and symptoms of mental illness/neurodegenerative disorders.
+3. Were there expression values that were not unique for specific genes? How did you handle these?\
+    The expression values I started with were unique, but once mapped to ensembl ids there were duplicates. I decided to keep them in the dataset upon further analysis as described above.
+4. Were there expression values that could not be mapped to current HUGO symbols?\
+    Yes. There were `r sum(ensemblToHUGO$hgnc_symbol == "")` ensembl ids that did not map to HUGO symbols.
+5. How many outliers were removed?\
+    During filtering we removed `r dim(reads)[1] -  dim(filteredReads)[1]` genes.
+6. How did you handle replicates?\
+    I chose not to remove them (see section: Checking for duplicates again).
+7. What is the final coverage of your dataset?\
+I lost `r nrow(reads) - nrow(filteredReadsFinal)` genes in filtering and mapping to HUGO Symbols, and 0 subjects or genes in normalization.
+
+## Differential Gene Expression
+
+We want to to visualize our normalized data using a heatmap to get an idea of gene expression patterns.
+
+```{r echo = FALSE, message = FALSE}
+heatmapMatrix <- t(scale(t(normalizedCounts)))
+
+if(min(heatmapMatrix) == 0){    
+  heatmapCol = colorRamp2(c( 0, max(heatmapMatrix)), c( "white", "red"))  
+  } else{    
+  heatmapCol = colorRamp2(c(min(heatmapMatrix), 0, max(heatmapMatrix)), c("blue", "white", "red"))  
+  }
+currentHeatmap <- Heatmap(as.matrix(heatmapMatrix), show_row_dend = TRUE, show_column_dend = TRUE,col=heatmapCol,show_column_names = TRUE, show_row_names = FALSE, show_heatmap_legend = TRUE)
+currentHeatmap
+```
+
+I will take a closer look at the clustering of patients in my dataset.
+
+
+```{r echo = FALSE, message = FALSE}
+
+plotMDS(heatmapMatrix, col = rep(c("darkgreen","blue", "red"),10)[factor(metainfo$status)])
+```
+Once again, it is clear to see that the patients are not clustering by the metrics evaluated in the study, i.e. there are not three separate clusters of samples corresponding to the PTSD presence/absence/past diagnosis categories.  The majority of the patients are clustering around 0 in the leading logFC dim1 and dim2. 
+
+Another way to visualize the clustering is to colour by patient, but seeing as there aren't two samples from one patient under differing conditions (i.e. before PTSD diagnosis and after, the following plot is not truly helpful in determining clustering patterns in the patients, definiteluy not as useful as if there were test and control conditions for each subject in the dataset.)
+
+
+```{r echo = FALSE, message = FALSE}
+patientColours <- rainbow(10)
+patientColours <- unlist(lapply(patientColours,FUN=function(x){rep(x,2)}))
+plotMDS(heatmapMatrix, col = patientColours )
+```
+**Limma Analysis**
+
+I'll begin by creating a linear model using Limma (Ritchie et al., 2005), starting with a design matrix.
+
+```{r echo = FALSE, message = FALSE}
+metainfo$status <- str_replace(metainfo$status, "ptsd:", "")
+metainfo$status <- as.factor(metainfo$status)
+modelDesign <- model.matrix(~ metainfo$status)
+kable(modelDesign, type="html")
+```
+
+The next step is to create a data matrix and fit the data to the above model. This will be done using empirical Bayes to compute differential expression (note trend=TRU because this si RNAseq data). From this a table will be generated which contains p values and adjusted p values for gene expressions calculated. 
+
+```{r warning = FALSE, r echo = FALSE, message = FALSE}
+expressionMatrix <- as.matrix(normalizedCounts)
+minimalSet <- ExpressionSet(assayData=expressionMatrix)
+fit <- lmFit(minimalSet, modelDesign)
+fit2 <- eBayes(fit,trend=TRUE)
+topfit <- topTable(fit2, 
+                   coef=ncol(modelDesign),
+                   adjust.method = "BH",
+                   number = nrow(expressionMatrix))
+#merge hgnc names to topfit table
+outputHits <- merge(rownames(normalizedCounts),
+                     topfit,
+                     by.y=0,by.x=1,
+                     all.y=TRUE)
+#sort by pvalue
+outputHits <- outputHits[order(outputHits$P.Value),]
+#view hits
+kable(outputHits[1:10,],type="html")
+```
+
+```{r echo = FALSE, message = FALSE}
+length(which(outputHits$P.Value < 0.05))
+length(which(outputHits$adj.P.Val < 0.05))
+```
+
+**Multiple Hypothesis Testing***
+
+As there are multiple tests being done to check the significance of so many genes, we have to correct for multiple tests. This is due to the fact that the more tests are performed, the greater the likelihood of a false positive occurring by chance. 
+
+Lecture slides suggested that to minimize the false discovery rate the linear model should be updated to account for both the patients' gene expression as well as  the number of patients (note the previous model just focused on the patients' gene expression).This could help us to control for patient variability.
+
+However, I received the message : Error in .ebayes(fit = fit, proportion = proportion, stdev.coef.lim = stdev.coef.lim,  : No residual degrees of freedom in linear model fits when I tried to fit the model below using empirical Bayes as I don't have replicated samples (Bioconductor Support, 2016). Controlling for patient variability through multiple testing does not apply to this dataset. Therefore the previous model using the Benjamni - Hochberg correction method is sufficient.
+
+```{r warning = FALSE, message = FALSE}
+modelDesignPat <- model.matrix(~ metainfo$title + metainfo$status)
+modelDesignPat[1:10,1:5]
+```
+***EdgeR Analysis***
+
+I looked at how the "Gene expression associated with PTSD in World Trade Center responders: An RNA sequencing study" paper performed differential expression analysis to get a better idea of where to go from here. The differential expression analysis they did was done using "DESeq252 software based on negative binomial generalized linear models, adjusting for age, race and the five cell type proportions (CD8T, CD4T, natural killer, Bcell, monocytes) in discovery and replication cohorts, respectively".
+
+This gave me reason to believe that I should not be using the Limma package, as it works best with data that has an underlying linear distribution.I decided to try EdgeR (Robinson et al., 2010), a package for data that works best when the data follows a negative binomial distribution.
+
+A negative binomial distribution has a specific shape when plotted, so I can easily verify that my data is not following a linear distribution by seeing if it adheres to the shape of the curve of a negative binomial distribution.
+
+```{r echo = FALSE, message = FALSE}
+dataMatrix <- as.matrix(normalizedCounts)
+d <- DGEList(counts=dataMatrix, group=metainfo$status)
+d <- estimateDisp(d, modelDesign)
+plotMeanVar(d, show.raw.vars = TRUE, show.tagwise.vars=TRUE,
+            show.ave.raw.vars = TRUE,
+            NBline=TRUE,
+            show.binned.common.disp.vars = TRUE)
+```
+The data clearly follows a negative distribution (as plotted by the red X's that follow the path of the blue line), meaning the EdgeR package will be well suited for differential analysis.The next step, as with Limma from before, is to to fit the data to the model.
+```{r echo = FALSE, message = FALSE}
+fit <- glmQLFit(d, modelDesign)
+qlf.posVNeg <- glmQLFTest(fit, coef=colnames(fit$coefficients)[2])
+kable(topTags(qlf.posVNeg), type="html")
+```
+
+Using this new underlying distribution assumption, I want to see if I have any significantly differentially expressed genes now: 
+
+```{r echo = FALSE, message = FALSE}
+qlfOutputHits <- topTags(qlf.posVNeg,sort.by = "PValue", n = nrow(normalizedCounts))
+length(which(qlfOutputHits$table$PValue < 0.05))
+length(which(qlfOutputHits$table$FDR < 0.05)) #FDR is adjusted p-values
+```
+Excitingly, I have  `r length(which(qlfOutputHits$table$PValue < 0.05))` genes pass the threshhold p value and `r length(which(qlfOutputHits$table$FDR < 0.05))` pass FDR (Benjamini Hochberg) correction.
+
+Now that I have some differently expressed genes, let's view these bad boys in a volcano plot!
+
+**Volcano Plot**
+
+Let's take a look at upregulated genes.
+
+```{r echo = FALSE, message = FALSE}
+plotVolcano <- cbind(qlfOutputHits$table$logFC, -log10(qlfOutputHits$table$FDR))
+colnames(plotVolcano) <- c("logFC", "P-val")
+upregulated <- qlfOutputHits$table$FDR < 0.05 & qlfOutputHits$table$logFC > 1
+downregulated <- qlfOutputHits$table$FDR < 0.05 & qlfOutputHits$table$logFC < 0
+point.col <- ifelse(upregulated, "red", "black")
+plot(plotVolcano, col = point.col)
+```
+There are not a lot of upregulated genes (clearly... there's only two red dots), so let's see what the volcano plot looks like with downregulated genes.
+
+```{r echo = FALSE, message = FALSE}
+point.col <- ifelse(downregulated, "blue", "black")
+plot(plotVolcano, col = point.col)
+```
+Seems to be a bit more interesting.
+
+**Top Hits**
+
+Now I want to make another heatmap and see if there is any clustering that is happening by PTSD: past, never, current condition. I will use ComplexHeatmap (Gu, 2016).
+
+```{r echo = FALSE, message = FALSE}
+topHits <- rownames(qlfOutputHits$table)[qlfOutputHits$table$FDR<0.05] 
+heatmapMatrixTophits <- t(
+  scale(t(heatmapMatrix[which(rownames(heatmapMatrix) %in% topHits),]))) 
+orderedMeta <- metainfo %>% arrange(status)
+orderedHeatmapMatrixTophits <- heatmapMatrixTophits[, orderedMeta$title]
+
+if(min(orderedHeatmapMatrixTophits) == 0){
+    heatmapCol = colorRamp2(c( 0, max(orderedHeatmapMatrixTophits)), 
+                             c( "white", "red"))
+  } else {
+    heatmapCol = colorRamp2(c(min(orderedHeatmapMatrixTophits), 0, max(orderedHeatmapMatrixTophits)), c("blue", "white", "red"))
+  }
+currHeatmap <- Heatmap(as.matrix(orderedHeatmapMatrixTophits),
+                           cluster_rows = TRUE,
+                           cluster_columns = FALSE,
+                               show_row_dend = TRUE,
+                               show_column_dend = FALSE,
+                               col=heatmapCol,
+                               show_column_names = TRUE, 
+                               show_row_names = FALSE,
+                               show_heatmap_legend = TRUE,
+                               )
+currHeatmap
+```
+324 samples make the column names difficult to read for the heatmap, but they are ordered by "current", "never" and "past" PTSD diagnosis as seen by `r head(currHeatmap@column_names_param$labels, 5)`. There doesn't seem to be extremely obviously clustering by diagnosis, but in the bottom right corner of the heatmap there is a section that's more blue and preceding it is a section that is more pale red, it's also more pale red at the beginning. 
+
+
+1. Calculate p-values for each of the genes in your expression set (see Limma Analysis and then see EdgeR Analysis). How many genes were significantly differentially expressed? What thresholds did you use and why?
+
+Using limma `r length(which(outputHits$P.Value < 0.05))` genes pass the threshhold p value and `r length(which(outputHits$adj.P.Val < 0.05))` genes pass correction. No values are therefore significant after correction. 
+
+Using EdgeR `r length(which(qlfOutputHits$table$PValue < 0.05))` genes pass the threshhold p value and `r length(which(qlfOutputHits$table$FDR < 0.05))` genes pass FDR (BH) correction.
+
+I chose the threshhold p value of 0.05 as it is accepted across scientific literature as significant. There is little benefit to being more stringent especially since I am doing multiple-hypothesis testing anyways. 
+
+2. Multiple hypothesis testing - correct your p-values using a multiple hypothesis correction method (see Multiple Hypothesis Testing). Which method did you use? And Why? How many genes passed correction?
+
+See Multiple Hypothesis Testing. I used the Benjamini-Hochberg (BH) method, as it is less strict than Bonferroni but still accepted as robust. There were `r length(which(qlfOutputHits$table$FDR < 0.05))` genes that passed the FDR (BH) correction.
+
+3. Show the amount of differentially expressed genes using an MA Plot or a Volcano plot (see Volcano Plot). Highlight genes of interest.
+
+See Volcano Plot.
+
+4. Visualize your top hits using a heatmap (see Top Hits). Do your conditions cluster together? Explain why or why not.
+
+See Top Hits.
+
+
+
+## Thresholded over-representation analysis
+
+Let's start by getting the upregulated and downregulated genes.
+
+**Getting Genes of Interest**
+
+I'll be using EdgeR as that is the method that permitted me to find differentially expressed genes.
+
+```{r echo = FALSE, message = FALSE}
+#I want the EnsemblIDs for later so I have to grab my other object with the ensembl ids attached and normalize those before continuing
+filteredReadsFull <- filteredReads %>% filter(HUGOSymbol != "")
+filteredReadsFull <- as.matrix(filteredReadsFull)
+filteredDataMatrix <- as.matrix(filteredReadsFinal)
+d <- DGEList(counts=filteredDataMatrix, group=metainfo$status)
+d <- calcNormFactors(d)
+normalizedCounts <- cpm(d)
+dataMatrix <- as.matrix(normalizedCounts)
+d <- DGEList(counts=dataMatrix, group=metainfo$status)
+d <- estimateDisp(d, modelDesign)
+
+
+fit <- glmQLFit(d, modelDesign)
+qlf.posVNeg <- glmQLFTest(fit, coef=colnames(fit$coefficients)[2])
+
+qlfOutputHits <- topTags(qlf.posVNeg,sort.by = "PValue",
+                           n = nrow(filteredReadsFull))
+length(which(qlfOutputHits$table$PValue < 0.05 & qlfOutputHits$table$logFC > 0))
+length(which(qlfOutputHits$table$PValue < 0.05 & qlfOutputHits$table$logFC < 0))
+```
+
+There are 71 upregulated genes, and 2155 downregulated genes, which is pretty spicy. I want to get the EnsemblIDs to put them into the g:profiler webpage to find matches so the next step is to get the  EnsemblIDs and save them into a text file. 
+
+```{r echo = FALSE, message = FALSE}
+qlfOutputHitsWGN <- merge(filteredReadsFull[,1:2],qlfOutputHits, by.x=2, by.y = 0)
+qlfOutputHitsWGN$rank <- -log(qlfOutputHitsWGN$PValue,base =10) * sign(qlfOutputHitsWGN$logFC)
+qlfOutputHitsWGN <- qlfOutputHitsWGN[order(qlfOutputHitsWGN$rank),]
+#Get all of the gene sets
+upregulatedGenes <- qlfOutputHitsWGN$`EnsemblId`[which(qlfOutputHitsWGN$PValue < 0.05 
+             & qlfOutputHitsWGN$logFC > 0)]
+downregulatedGenes <- qlfOutputHitsWGN$`EnsemblId`[which(qlfOutputHitsWGN$PValue < 0.05 
+             & qlfOutputHitsWGN$logFC < 0)]
+allGenes <- c(downregulatedGenes, upregulatedGenes)
+#text files for g:profiler
+write.table(x=upregulatedGenes,
+            file="A2UpregulatedGenes.txt", sep = "\t",
+            row.names = FALSE,col.names = FALSE,quote = FALSE)
+write.table(x=downregulatedGenes,
+            file="A2DownregulatedGenes.txt",sep = "\t",
+            row.names = FALSE,col.names = FALSE,quote = FALSE)
+write.table(x=allGenes,
+            file="A2AllGenes.txt",sep = "\t",
+            row.names = FALSE,col.names = FALSE,quote = FALSE)
+```
+**Annotation Data**
+
+The annotation data sets I selected on g:profiler (Raudvere et al., 2019) GO biological process, Reactome, and WikiPathways, as they were the datasets we had used in a previous assignment and I felt comfortable interpreting them. The version I used was e102_eg49_p15_7a9b4d6. 
+
+**Genesets Returned**
+
+I used the same significance thresholds as when I performed gene expression analysis (0.05) with multiple-hypothesis testing correction, i.e. with the FDR-corrected p values. This was done using the Benjamini-Hochberg method, and again, the threshhold for p values was 0.05, as this is the standard.
+
+
+*Up Regulation Results*
+
+* GO biological pathways: T= 30, Q= 36 T∩Q= 4 
+
+* Reactome: T= 191, Q= 26 T∩Q= 7
+
+* Wiki Pathways: T= 0, Q= 0 T∩Q=0
+
+*Down Regulation Results*
+
+* GO biological pathways: T= 4027, Q= 1682 T∩Q= 582
+
+* Reactome: T= 234, Q= 1058 T∩Q= 63
+
+* Wiki Pathways: T= 162, Q= 800 T∩Q= 52
+
+*All Gene Results*
+
+* GO biological pathways: T= 4027, Q= 1718 T∩Q= 591
+
+* Reactome: T= 234, Q= 1084 T∩Q= 63
+
+* Wiki Pathways: T= 162, Q= 826 T∩Q= 52
+
+
+*Screenshots of gProfiler results*
+
+*Upregulated genes*
+
+![](./data/GOBPupGenes.png)
+
+![](./data/REACupGenes.png)
+(No Wiki Pathways Results)
+
+The genesets returned top terms related to hydrogen peroxide catabolic process and interferon signaling, generally related to immune system and metabolic processes (Gongora et al., 1999). This suggests the upregulated genes are involved in antiviral defense/immunity.
+
+*Downregulated genes* 
+![](./data/GOBPdownGenes.png)
+
+![](./data/REACdownGenes.png)
+![](./data/WPdownGenes.png)
+The genesets returned top terms related to protein modification enzymes, chromatin modification enzymes and the EGF/EGFR signal pathway which is involved in growth, differentiation, migration, adhesion and cell survival (WikiPathways, 2020). This indicates the downregulated genes are involved in cell growth and differentiation. 
+
+*All Genes*
+
+![](./data/GOBPallGenes.png)
+
+![](./data/REACallGenes.png)
+![](./data/WPallGenes.png)
+
+The top term genesets for all genes were dominated by the downregulated gene results, again related to cell differentiation/survival. 
+
+
+1. Which method did you choose and why?
+
+I chose EdgeR as it had previously returned differentiated genes in the dataset, and the undelying assumptions of the data distributions matched this dataset best.
+
+2. What annotation data did you use and why? What version of the annotation are you using?
+
+See Annotation Data.
+
+3. How many genesets were returned with what thresholds?
+
+See Genesets Returned.
+
+4. Run the analysis using the up-regulated set of genes, and the down-regulated set of genes separately. How do these results compare to using the whole list (i.e all differentially expressed genes together vs. the up-regulated and down regulated differentially expressed genes separately)?
+
+See Genesets Returned. The results for all genes together were overall dominated by the the down-regulated genes, putting the genes together only returned 9 more genes in the intersection of T and Q. The terms returned were related to the same overarching themes as for the downregulated genes. However, there's a clear distinction in term results between up-regulated and down-regulated genes (immune response/antiviral defense and cell differentiation/growth respectively).
+
+5. Present your results with the use of tables and screenshots. All figures should have appropriate figure legends.
+
+See Genesets Returned.
+
+
+## Interpretation
+
+1. Do the over-representation results support conclusions or mechanism discussed in the original paper?
+
+The paper discussed they had found enrichment in "glucocorticoid receptor signaling and immunity-related pathways" but mentioned that these pathways were not robust to FDR correction. The paper also mentioned that gene FKBP5, with EnsembleID ENSG00000096060 was upregulated in patients with PTSD, which is found in the downregulated genes result of my analysis (downregulated in non-PTSD subjects as compared to those with PTSD). The glucocorticoid receptor pathway is a component of the immune response and we can see these immune response pathways come up in my analysis as well (upregulated gene pathways, which would be downregulated in PTSD patients). 
+
+
+2. Can you find evidence, i.e. publications, to support some of the results that you see. How does this evidence support your results.
+
+There is a lot of evidence supporting immune dysregulation in PTSD patients, which supports the results found in my upregulated gene pathway analysis. For example, the paper "Inflammatory markers in post-traumatic stress disorder: a systematic review, meta-analysis, and meta-regression" showed increased inflammation in subjects with PTSD compared to healthy controls (Passos et al., 2015). Another poignant example of this finding was the paper "Posttraumatic stress disorder and physical illness: results from clinical and epidemiologic studies" which compiled evidence to show that patients with PTSD may be at risk for autoimmune diseases (Boscarino, 2004). 
+
+
+## References
+
+1. Bioconductor Support. (2016). ERROR: No residual degrees of freedom in linear model fits. Retrieved March 15, 2021, from https://support.bioconductor.org/p/59168/
+
+2. Boscarino JA (2004). Posttraumatic stress disorder and physical illness: results from clinical and epidemiologic studies. Ann N Y Acad Sci.1032:141-53. doi: 10.1196/annals.1314.011. PMID: 15677401.
+
+3. Gongora C, Mechti N. L'interféron: un mécanisme complexe de signalisation [Interferon signaling pathways] (1999). Bull Cancer. 86(11):911-9. French. PMID: 10586107.
+
+4. Gu, Z. (2016) Complex heatmaps reveal patterns and correlations in multidimensional
+  genomic data. Bioinformatics.
+
+5. Kuan, P., Waszczuk, M. A., Kotov, R., Clouston, S., Yang, X., Singh, P. K., . . . Luft, B. J. (2017). Gene expression associated with PTSD in World Trade Center responders: An RNA sequencing study. Translational Psychiatry, 7(12). doi:10.1038/s41398-017-0050-1
+
+6. Passos IC, Vasconcelos-Moreno MP, Costa LG, Kunz M, Brietzke E, Quevedo J, Salum G, Magalhães PV, Kapczinski F, Kauer-Sant'Anna M (2015). Inflammatory markers in post-traumatic stress disorder: a systematic review, meta-analysis, and meta-regression. Lancet Psychiatry, 2(11):1002-12. doi: 10.1016/S2
+
+7. Ritchie, M.E., Phipson, B., Wu, D., Hu, Y., Law, C.W., Shi, W., and Smyth, G.K.
+  (2015). limma powers differential expression analyses for RNA-sequencing and
+  microarray studies. Nucleic Acids Research 43(7), e47.
+  
+8. Robinson MD, McCarthy DJ and Smyth GK (2010). edgeR: a Bioconductor package for
+  differential expression analysis of digital gene expression data. Bioinformatics 26,
+  139-140
+  
+9. Uku Raudvere, Liis Kolberg, Ivan Kuzmin, Tambet Arak, Priit Adler, Hedi Peterson, Jaak Vilo: g:Profiler: a web server for functional enrichment analysis and conversions of gene lists (2019 update) Nucleic Acids Research 2019; doi:10.1093/nar/gkz369 [PDF].
+
+10. Wiki Pathways. (2020, June 30). EGF/EGFR Signaling Pathway (Homo sapiens). Retrieved from https://www.wikipathways.org/index.php/Pathway:WP437
+
+
