@@ -391,7 +391,7 @@ kable(modelDesign, type="html")
 
 The next step is to create a data matrix and fit the data to the above model. This will be done using empirical Bayes to compute differential expression (note trend=TRU because this si RNAseq data). From this a table will be generated which contains p values and adjusted p values for gene expressions calculated. 
 
-```{r warning = FALSE, r echo = FALSE, message = FALSE}
+```{r warning = FALSE, echo = FALSE, message = FALSE}
 expressionMatrix <- as.matrix(normalizedCounts)
 minimalSet <- ExpressionSet(assayData=expressionMatrix)
 fit <- lmFit(minimalSet, modelDesign)
@@ -416,7 +416,7 @@ length(which(outputHits$P.Value < 0.05))
 length(which(outputHits$adj.P.Val < 0.05))
 ```
 
-**Multiple Hypothesis Testing***
+**Multiple Hypothesis Testing**
 
 As there are multiple tests being done to check the significance of so many genes, we have to correct for multiple tests. This is due to the fact that the more tests are performed, the greater the likelihood of a false positive occurring by chance. 
 
